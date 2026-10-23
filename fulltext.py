@@ -80,14 +80,30 @@ def _clean_text(text: str) -> str:
     return "\n".join(out).strip()[:MAX_BODY_CHARS]
 
 
+BLOCK_TAGS = ["p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+              "blockquote", "tr", "pre", "section", "article", "ul", "ol", "table"]
+
+
 def _text_of(node) -> str:
-    """HTML 덩어리에서 이미지·버튼 등을 빼고 글자만 뽑습니다."""
+    """
+    HTML 덩어리에서 이미지·버튼 등을 빼고 글자만 뽑습니다.
+    굵은 글씨·색깔 글씨(span, b 등)는 문장 중간에 있으므로 줄을 바꾸지 않고,
+    문단(p, div 등)이 끝날 때와 <br>에서만 줄을 바꿉니다.
+    """
     if node is None:
         return ""
     for sel in REMOVE_SELECTORS:
         for bad in node.select(sel):
             bad.decompose()
-    return _clean_text(node.get_text("\n"))
+    # HTML 원본의 줄맞춤용 공백(태그 사이 빈 줄)은 글 내용이 아니므로 지웁니다.
+    for s in node.find_all(string=True):
+        if "\n" in s and not s.strip():
+            s.extract()
+    for br in node.find_all("br"):
+        br.replace_with("\n")
+    for block in node.find_all(BLOCK_TAGS):
+        block.append("\n")
+    return _clean_text(node.get_text(""))
 
 
 def _first(soup, selectors: List[str]):
