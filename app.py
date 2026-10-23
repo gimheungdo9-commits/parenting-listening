@@ -4,27 +4,26 @@ from datetime import datetime
 from channel_registry import get_all_channels
 from processor import filter_and_process, create_zip_package, load_history, save_to_master_and_history, load_master_urls, get_archive_file
 
-try:
-    from deep_translator import GoogleTranslator
-    TRANSLATOR_AVAILABLE = True
-except ImportError:
-    TRANSLATOR_AVAILABLE = False
+import requests as req_lib
 
 def translate_to_english(kw_list):
-    if not TRANSLATOR_AVAILABLE:
-        return {}
     result = {}
-    try:
-        translator = GoogleTranslator(source='ko', target='en')
-        for kw in kw_list:
-            if all(ord(c) < 128 or c.isspace() for c in kw):
-                result[kw] = kw
-            else:
-                translated = translator.translate(kw)
+    for kw in kw_list:
+        if all(ord(c) < 128 or c.isspace() for c in kw):
+            result[kw] = kw
+            continue
+        try:
+            resp = req_lib.get(
+                "https://api.mymemory.translated.net/get",
+                params={"q": kw, "langpair": "ko|en"},
+                timeout=5
+            )
+            if resp.status_code == 200:
+                translated = resp.json().get("responseData", {}).get("translatedText", "")
                 if translated:
                     result[kw] = translated
-    except Exception:
-        pass
+        except Exception:
+            continue
     return result
 
 st.set_page_config(page_title="육아 소셜 리스닝 수집기", page_icon="👶", layout="wide")
