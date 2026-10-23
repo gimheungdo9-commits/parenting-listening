@@ -6,8 +6,14 @@ import pandas as pd
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 from typing import List, Dict, Any, Tuple
+from fulltext import STATUS_MEMBERS, to_json_str
 
 DATA_DIR = "data"
+
+# 결과 파일 칸 구성 (한 곳에서 관리)
+RESULT_COLS = ["채널", "검색식", "제목", "본문요약", "본문전체", "본문상태", "작성자", "작성일", "URL", "수집일시", "홍보의심"]
+MD_COLS = ["채널", "검색식", "제목", "본문요약", "본문상태", "작성자", "작성일", "URL", "홍보의심"]
+READ_LIST_COLS = ["카페명", "제목", "요약", "URL", "검색식", "읽음여부", "메모"]
 ARCHIVE_DIR = os.path.join(DATA_DIR, "archives")
 HISTORY_FILE = os.path.join(DATA_DIR, "collection_history.csv")
 MASTER_FILE = os.path.join(DATA_DIR, "master_database.csv")
@@ -44,7 +50,7 @@ def load_master_df():
 
 def load_history():
     ensure_data_dir()
-    cols = ["수집일시", "작업자", "채널", "검색식", "요청건수", "총수집", "광고제외", "정보글제외", "반려동물제외", "기업블로그제외", "무관제외", "중복제외", "최종저장", "파일명"]
+    cols = ["수집일시", "작업자", "채널", "검색식", "요청건수", "총수집", "광고제외", "정보글제외", "반려동물제외", "기업블로그제외", "무관제외", "중복제외", "본문광고제외", "최종저장", "직접읽을글", "파일명"]
     if os.path.exists(HISTORY_FILE):
         try:
             df = pd.read_csv(HISTORY_FILE, encoding="utf-8-sig")
@@ -198,50 +204,88 @@ def filter_and_process(items, filters, exclude_master_dup=True):
     stats["saved"] = len(valid_items)
     return valid_items, excluded_items, stats
 
+def _prepare_df(items_or_df, cols):
+    df = items_or_df.copy() if isinstance(items_or_df, pd.DataFrame) else pd.DataFrame(items_or_df)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df.fillna("")
+
+
+def build_read_list(df):
+    """파트 C: 회원전용이라 본문을 못 가져온 카페 글 → 직접 읽을 글 목록 (카페명 순)."""
+    if df.empty or "본문상태" not in df.columns:
+        return pd.DataFrame(columns=READ_LIST_COLS)
+    members = df[df["본문상태"].astype(str).str.startswith(STATUS_MEMBERS)]
+    if members.empty:
+        return pd.DataFrame(columns=READ_LIST_COLS)
+    out = pd.DataFrame({
+        "카페명": members["작성자"],
+        "제목": members["제목"],
+        "요약": members["본문요약"],
+        "URL": members["URL"],
+        "검색식": members["검색식"],
+        "읽음여부": "",
+        "메모": "",
+    })
+    return out.sort_values(["카페명", "제목"], kind="stable").reset_index(drop=True)
+
+
+def read_list_summary(items):
+    """화면 표시용: (직접 읽을 글 수, 카페 수)."""
+    df = build_read_list(_prepare_df(items, RESULT_COLS))
+    return len(df), (df["카페명"].nunique() if not df.empty else 0)
+
+
+def _note_content(row):
+    body = str(row.get("본문전체", "")).strip()
+    status = str(row.get("본문상태", "")).strip()
+    header = (
+        "---\n"
+        "title: " + to_json_str(row.get("제목", "")) + "\n"
+        "channel: " + to_json_str(row.get("채널", "")) + "\n"
+        "author: " + to_json_str(row.get("작성자", "")) + "\n"
+        "date: " + to_json_str(row.get("작성일", "")) + "\n"
+        "url: " + to_json_str(row.get("URL", "")) + "\n"
+        "keyword: " + to_json_str(row.get("검색식", "")) + "\n"
+        "body_status: " + to_json_str(status) + "\n"
+        "collected_at: " + to_json_str(row.get("수집일시", "")) + "\n"
+        "---\n\n"
+        "# " + str(row.get("제목", "")) + "\n\n"
+    )
+    if body:
+        return header + "### 본문\n" + body + "\n"
+    reason = status or "본문 없음"
+    return header + "### 본문 요약 (전체 본문 없음: " + reason + ")\n" + str(row.get("본문요약", "")) + "\n"
+
+
+def _write_notes(zf, df):
+    for i, row in df.iterrows():
+        safe_title = re.sub(r'[\\/:*?"<>|\n\r\t]', '_', str(row.get("제목", "")))[:30].strip()
+        fname = "notes/" + str(row.get("채널", "")) + "_" + str(i + 1) + "_" + safe_title + ".md"
+        zf.writestr(fname, _note_content(row))
+
+
 def create_zip_package(valid_items, excluded_items, time_tag, worker=""):
     ensure_data_dir()
     zip_buffer = io.BytesIO()
 
-    cols = ["채널", "검색식", "제목", "본문요약", "본문전체", "작성자", "작성일", "URL", "수집일시", "홍보의심"]
-    valid_df = pd.DataFrame(valid_items)
-    for c in cols:
-        if c not in valid_df.columns:
-            valid_df[c] = ""
-    valid_df = valid_df[cols]
+    valid_df = _prepare_df(valid_items, RESULT_COLS)[RESULT_COLS].reset_index(drop=True)
 
     ex_cols = ["채널", "검색식", "제목", "작성자", "URL", "제외사유"]
-    excluded_df = pd.DataFrame(excluded_items)
-    for c in ex_cols:
-        if c not in excluded_df.columns:
-            excluded_df[c] = ""
-    excluded_df = excluded_df[ex_cols]
+    excluded_df = _prepare_df(excluded_items, ex_cols)[ex_cols]
+
+    read_df = build_read_list(valid_df)
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("수집결과.csv", valid_df.to_csv(index=False, encoding="utf-8-sig"))
         zf.writestr("제외된글.csv", excluded_df.to_csv(index=False, encoding="utf-8-sig"))
+        zf.writestr("직접읽을글.csv", read_df.to_csv(index=False, encoding="utf-8-sig"))
 
-        md_cols = ["채널", "검색식", "제목", "본문요약", "작성자", "작성일", "URL", "홍보의심"]
-        md_table = simple_df_to_markdown(valid_df[md_cols])
+        md_table = simple_df_to_markdown(valid_df[MD_COLS])
         zf.writestr("수집결과.md", "# 육아 소셜 리스닝 수집 결과 (" + time_tag + ")\n\n" + md_table)
 
-        for i, row in valid_df.iterrows():
-            safe_title = re.sub(r'[\/:*?"<>|]', '_', str(row["제목"]))[:30].strip()
-            fname = "notes/" + str(row["채널"]) + "_" + str(i+1) + "_" + safe_title + ".md"
-            note_content = (
-                "---\n"
-                "title: " + str(row["제목"]) + "\n"
-                "channel: " + str(row["채널"]) + "\n"
-                "author: " + str(row["작성자"]) + "\n"
-                "date: " + str(row["작성일"]) + "\n"
-                "url: " + str(row["URL"]) + "\n"
-                "keyword: " + str(row["검색식"]) + "\n"
-                "collected_at: " + str(row["수집일시"]) + "\n"
-                "---\n\n"
-                "# " + str(row["제목"]) + "\n\n"
-                "### 본문 요약\n" + str(row["본문요약"]) + "\n\n"
-                "### 본문 전체\n" + str(row["본문전체"]) + "\n"
-            )
-            zf.writestr(fname, note_content)
+        _write_notes(zf, valid_df)
 
     zip_bytes = zip_buffer.getvalue()
     safe_worker = re.sub(r'[\/:*?"<>|]', '', worker)[:10].strip() or "팀원"
@@ -269,39 +313,17 @@ def create_cumulative_zip():
     time_tag = datetime.now().strftime("%Y%m%d_%H%M")
     zip_buffer = io.BytesIO()
 
-    all_cols = ["채널", "검색식", "제목", "본문요약", "본문전체", "작성자", "작성일", "URL", "수집일시"]
-    for c in all_cols:
-        if c not in master_df.columns:
-            master_df[c] = ""
+    master_df = _prepare_df(master_df, RESULT_COLS).reset_index(drop=True)
+    read_df = build_read_list(master_df)
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("전체누적_수집결과.csv", master_df.to_csv(index=False, encoding="utf-8-sig"))
+        zf.writestr("전체누적_직접읽을글.csv", read_df.to_csv(index=False, encoding="utf-8-sig"))
 
-        md_cols = ["채널", "검색식", "제목", "본문요약", "작성자", "작성일", "URL"]
-        for c in md_cols:
-            if c not in master_df.columns:
-                master_df[c] = ""
-        md_table = simple_df_to_markdown(master_df[md_cols])
+        md_table = simple_df_to_markdown(master_df[MD_COLS])
         zf.writestr("전체누적_수집결과.md", "# 전체 누적 수집 결과 (" + time_tag + ")\n\n" + md_table)
 
-        for i, row in master_df.iterrows():
-            safe_title = re.sub(r'[\/:*?"<>|]', '_', str(row.get("제목", "")))[:30].strip()
-            fname = "notes/" + str(row.get("채널", "")) + "_" + str(i+1) + "_" + safe_title + ".md"
-            note_content = (
-                "---\n"
-                "title: " + str(row.get("제목", "")) + "\n"
-                "channel: " + str(row.get("채널", "")) + "\n"
-                "author: " + str(row.get("작성자", "")) + "\n"
-                "date: " + str(row.get("작성일", "")) + "\n"
-                "url: " + str(row.get("URL", "")) + "\n"
-                "keyword: " + str(row.get("검색식", "")) + "\n"
-                "collected_at: " + str(row.get("수집일시", "")) + "\n"
-                "---\n\n"
-                "# " + str(row.get("제목", "")) + "\n\n"
-                "### 본문 요약\n" + str(row.get("본문요약", "")) + "\n\n"
-                "### 본문 전체\n" + str(row.get("본문전체", "")) + "\n"
-            )
-            zf.writestr(fname, note_content)
+        _write_notes(zf, master_df)
 
     zip_bytes = zip_buffer.getvalue()
     zip_filename = "전체누적결과_" + time_tag + ".zip"

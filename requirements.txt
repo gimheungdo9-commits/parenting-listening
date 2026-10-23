@@ -2,3 +2,4 @@ streamlit
 pandas
 requests
 google-api-python-client
+beautifulsoup4

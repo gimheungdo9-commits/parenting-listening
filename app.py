@@ -5,7 +5,8 @@ from datetime import datetime
 from channel_registry import get_all_channels
 from processor import (filter_and_process, create_zip_package, load_history,
                         save_to_master_and_history, load_master_urls,
-                        get_archive_file, create_cumulative_zip)
+                        get_archive_file, create_cumulative_zip, read_list_summary)
+from fulltext import enrich_full_text, mark_fetch_off, DEFAULT_BODY_AD_WORDS
 
 def translate_to_english(kw_list):
     result = {}
@@ -143,6 +144,11 @@ with col1:
     sort_option = st.radio("정렬 기준", ["정확도순", "최신순"], horizontal=True)
     exclude_master_dup = st.checkbox("👥 이전 팀원 수집 중복 제외", value=True)
     auto_translate = st.checkbox("🌐 한글→영어 자동 번역 (해외 채널 동시 검색)", value=True)
+    fetch_full = st.checkbox("📄 본문 전체 가져오기 (블로그·지식iN·공개 카페글)", value=True,
+                             help="필터를 통과한 글만 본문을 가져옵니다. 글마다 1~2초씩 쉬어서 시간이 걸려요. "
+                                  "회원전용 카페 글은 가져오지 않고 '직접 읽을 글' 목록으로 보냅니다.")
+    if fetch_full:
+        st.caption("⏱️ 예상: 글 100건이면 본문 가져오기에 약 2~3분 추가")
 
 with col2:
     st.subheader("3. 수집 채널 선택")
@@ -189,10 +195,15 @@ with st.expander("⚙️ 필터 세부 설정"):
         info_words_text = st.text_area("📑 정보글 제외어 (제목)",
             value="총정리, 완벽 가이드, 완벽정리, 가이드, 정리해 드립니다, 알아보기, 알아봅시다, 시기별, 단계별, 방법 총, 꿀팁 모음, 나무위키, 위키", height=90)
         pet_words_text = st.text_area("🐱 반려동물 제외어 (제목+요약+작성자)",
-            value="고양이, 강아지, 앵무, 코뉴어, 새끼고양이, 집사, 펠렛, 사료, 이유조, 반려, 펫, 냥, 댕댕", height=90)
+            value="고양이, 강아지, 앵무, 코뉴어, 새끼고양이, 집사, 펠렛, 사료, 이유조, 반려, 펫, 냥이, 댕댕", height=90)
+        st.caption("⚠️ '냥' 한 글자는 '그냥'까지 걸러서 '냥이'로 바꿔 두었어요.")
     with f2:
         req_words_text = st.text_area("🍼 육아 필수어",
             value="아기, 아이, 애기, 육아, 엄마, 아빠, 신생아, 개월, 돌, 이유식, 수유, 분유, 모유, 어린이집, 유치원, 통잠, 기저귀, 남편, 와이프", height=90)
+        body_ad_words_text = st.text_area("📄 본문 광고 표시어 (본문 전체에서 검사)",
+            value=", ".join(DEFAULT_BODY_AD_WORDS), height=90,
+            help="본문 맨 아래 '제품을 제공받아…' 같은 협찬 표시를 잡습니다. "
+                 "'광고', '쿠폰'처럼 짧은 단어는 진짜 부모 글까지 걸러서 일부러 뺐어요.")
         min_length = st.number_input("📏 최소 글자 수", 10, 200, 30)
         st.caption("🏢 작성자에 '공식'이 포함된 기업 블로그는 자동 제외됩니다.")
         st.caption("📢 '이너프렌즈3기' 같은 체험단 N기 패턴도 자동 감지됩니다.")
@@ -256,6 +267,26 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
     status_text.write("🧹 글 정제 및 중복 검사 중...")
     valid_items, excluded_items, stats = filter_and_process(all_raw_items, filter_config, exclude_master_dup)
 
+    # 📄 파트 B: 본문 전체 가져오기 (필터 통과한 글만)
+    stats["body_ad"] = 0
+    ft_stats = None
+    if fetch_full and valid_items:
+        progress_bar.progress(0.0)
+
+        def _ft_progress(done, total, label):
+            progress_bar.progress(done / total if total else 1.0)
+            status_text.write("📄 본문 가져오는 중 **" + str(done) + " / " + str(total) + "** · " + label)
+
+        body_ad_words = [w.strip() for w in body_ad_words_text.split(",")]
+        valid_items, body_excluded, ft_stats = enrich_full_text(valid_items, body_ad_words, _ft_progress)
+        excluded_items.extend(body_excluded)
+        stats["body_ad"] = ft_stats["body_ad"]
+        stats["saved"] = len(valid_items)
+    else:
+        mark_fetch_off(valid_items)
+
+    read_count, read_cafes = read_list_summary(valid_items)
+
     time_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_bytes, zip_filename = create_zip_package(valid_items, excluded_items, time_tag, worker=worker_name)
 
@@ -273,7 +304,9 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
         "기업블로그제외": stats["corporate"],
         "무관제외": stats["irrelevant"],
         "중복제외": dup_total,
+        "본문광고제외": stats["body_ad"],
         "최종저장": stats["saved"],
+        "직접읽을글": read_count,
         "파일명": zip_filename
     }
     save_to_master_and_history(valid_items, history_record)
@@ -290,8 +323,15 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
     if stats["corporate"]: summary_parts.append("기업블로그 " + str(stats["corporate"]))
     if stats["irrelevant"]: summary_parts.append("무관 " + str(stats["irrelevant"]))
     if stats["short"]: summary_parts.append("글자수미달 " + str(stats["short"]))
+    if stats["body_ad"]: summary_parts.append("본문 광고표시 " + str(stats["body_ad"]))
     if summary_parts:
         st.info("📊 제외 상세: " + " / ".join(summary_parts) + "  (총 수집 " + str(stats["total"]) + "건)")
+    if ft_stats:
+        st.info("📄 본문: 전체 " + str(ft_stats["full"]) + "건 / 회원전용(요약만) " + str(ft_stats["members"])
+                + "건 / 가져오기 실패 " + str(ft_stats["failed"]) + "건")
+    if read_count:
+        st.warning("📌 직접 읽을 글 **" + str(read_count) + "건** (카페 " + str(read_cafes) + "곳) — "
+                   "다운로드 파일 안 `직접읽을글.csv`에 있어요. 카페에 정식 가입한 뒤 읽고 메모해 주세요.")
 
     st.session_state.valid_items = valid_items
     st.session_state.excluded_items = excluded_items
@@ -301,7 +341,7 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
 # 6. 결과 미리보기 및 다운로드
 if "valid_items" in st.session_state and st.session_state.valid_items:
     st.subheader("📋 수집 결과 미리보기 (" + str(len(st.session_state.valid_items)) + "건)")
-    preview_cols = ["채널", "검색식", "제목", "작성자", "작성일", "URL", "홍보의심"]
+    preview_cols = ["채널", "검색식", "제목", "본문상태", "작성자", "작성일", "URL", "홍보의심"]
     df_preview = pd.DataFrame(st.session_state.valid_items)
     for c in preview_cols:
         if c not in df_preview.columns:
