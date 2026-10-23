@@ -208,8 +208,14 @@ def parse_kin_html(html: str) -> Tuple[str, str]:
             if len(answers) >= MAX_ANSWERS:
                 break
 
+    # 화면에 붙어 있는 "질문" 표시 글자 제거
+    if q_title is not None:
+        for el in q_title.find_all(True):
+            if el.get_text(strip=True) in ("질문", "Q"):
+                el.decompose()
     title_txt = _text_of(q_title)
     body_txt = _text_of(q_body)
+    title_txt = re.sub(r"^(질문|Q)\s*\n", "", title_txt).strip()
     if not (title_txt or body_txt):
         return "", date
 

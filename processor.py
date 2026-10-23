@@ -142,6 +142,7 @@ def filter_and_process(items, filters, exclude_master_dup=True):
 
     master_urls = load_master_urls() if exclude_master_dup else set()
     valid_dict = {}
+    seen_content = set()
     excluded_items = []
     stats = {
         "total": len(items), "ad": 0, "info": 0, "irrelevant": 0,
@@ -223,7 +224,14 @@ def filter_and_process(items, filters, exclude_master_dup=True):
             promo_flag = "해시태그 과다"
         item["홍보의심"] = promo_flag
 
-        # 8. 이번 수집 내 중복
+        # 8. 이번 수집 내 중복 (같은 주소, 또는 같은 사람이 똑같은 글을 두 번 올린 경우)
+        content_key = (author.strip(), snippet.strip())
+        if norm_url not in valid_dict and snippet.strip() and content_key in seen_content:
+            stats["dup"] += 1
+            excluded_items.append({**item, "제외사유": "같은 작성자의 같은 내용 중복"})
+            continue
+        if snippet.strip():
+            seen_content.add(content_key)
         if norm_url in valid_dict:
             stats["dup"] += 1
             existing = valid_dict[norm_url]
