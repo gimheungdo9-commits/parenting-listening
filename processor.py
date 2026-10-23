@@ -16,14 +16,14 @@ def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
-def normalize_url(url: str) -> str:
+def normalize_url(url):
     if not url:
         return ""
     url = url.replace("m.blog.naver.com", "blog.naver.com")
     parsed = urlsplit(url)
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
-def load_master_urls() -> set:
+def load_master_urls():
     ensure_data_dir()
     if os.path.exists(MASTER_FILE):
         try:
@@ -33,9 +33,18 @@ def load_master_urls() -> set:
             return set()
     return set()
 
-def load_history() -> pd.DataFrame:
+def load_master_df():
     ensure_data_dir()
-    cols = ["수집일시", "작업자", "채널", "검색식", "요청건수", "총수집", "광고제외", "정보글제외", "무관제외", "중복제외", "최종저장", "파일명"]
+    if os.path.exists(MASTER_FILE):
+        try:
+            return pd.read_csv(MASTER_FILE, encoding="utf-8-sig")
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+def load_history():
+    ensure_data_dir()
+    cols = ["수집일시", "작업자", "채널", "검색식", "요청건수", "총수집", "광고제외", "정보글제외", "반려동물제외", "기업블로그제외", "무관제외", "중복제외", "최종저장", "파일명"]
     if os.path.exists(HISTORY_FILE):
         try:
             df = pd.read_csv(HISTORY_FILE, encoding="utf-8-sig")
@@ -47,7 +56,7 @@ def load_history() -> pd.DataFrame:
             return pd.DataFrame(columns=cols)
     return pd.DataFrame(columns=cols)
 
-def get_archive_file(filename: str):
+def get_archive_file(filename):
     ensure_data_dir()
     path = os.path.join(ARCHIVE_DIR, filename)
     if os.path.exists(path):
@@ -55,7 +64,7 @@ def get_archive_file(filename: str):
             return f.read()
     return None
 
-def save_to_master_and_history(valid_items: List[Dict[str, Any]], history_record: Dict[str, Any]):
+def save_to_master_and_history(valid_items, history_record):
     ensure_data_dir()
     if valid_items:
         new_df = pd.DataFrame(valid_items)
@@ -71,60 +80,90 @@ def save_to_master_and_history(valid_items: List[Dict[str, Any]], history_record
             new_df.to_csv(MASTER_FILE, index=False, encoding="utf-8-sig")
 
     hist_df = load_history()
-    new_hist_row = pd.DataFrame([history_record])
-    updated_hist = pd.concat([new_hist_row, hist_df], ignore_index=True)
-    updated_hist.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
+    new_row = pd.DataFrame([history_record])
+    updated = pd.concat([new_row, hist_df], ignore_index=True)
+    updated.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
 
-def simple_df_to_markdown(df: pd.DataFrame) -> str:
+def simple_df_to_markdown(df):
     headers = list(df.columns)
     lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join(["---"] * len(headers)) + " |"
     ]
     for _, row in df.iterrows():
-        clean_row = [str(val).replace("\n", " ").replace("|", "-") for val in row]
-        lines.append("| " + " | ".join(clean_row) + " |")
+        cells = [str(v).replace("\n", " ").replace("|", "-")[:100] for v in row]
+        lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
-def filter_and_process(items: List[Dict[str, Any]], filters: Dict[str, Any], exclude_master_dup: bool = True) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
+def filter_and_process(items, filters, exclude_master_dup=True):
     ad_words = [w.strip() for w in filters.get("ad_words", []) if w.strip()]
     info_words = [w.strip() for w in filters.get("info_words", []) if w.strip()]
     req_words = [w.strip() for w in filters.get("req_words", []) if w.strip()]
+    pet_words = [w.strip() for w in filters.get("pet_words", []) if w.strip()]
     min_length = filters.get("min_length", 30)
 
     master_urls = load_master_urls() if exclude_master_dup else set()
     valid_dict = {}
     excluded_items = []
-    stats = {"total": len(items), "ad": 0, "info": 0, "irrelevant": 0, "short": 0, "dup": 0, "master_dup": 0, "saved": 0}
+    stats = {
+        "total": len(items), "ad": 0, "info": 0, "irrelevant": 0,
+        "short": 0, "dup": 0, "master_dup": 0, "pet": 0, "corporate": 0, "saved": 0
+    }
 
     for item in items:
         title = item.get("제목", "")
         snippet = item.get("본문요약", "")
-        full_text = f"{title} {snippet}"
+        author = item.get("작성자", "")
+        full_text = title + " " + snippet
         url = item.get("URL", "")
         norm_url = normalize_url(url)
 
+        # 0. 이전 팀원 수집 누적 중복
         if exclude_master_dup and norm_url in master_urls:
             stats["master_dup"] += 1
-            excluded_items.append({**item, "제외사유": "이전 팀원 수집 누적 중복 (마스터 DB에 이미 존재)"})
+            excluded_items.append({**item, "제외사유": "이전 팀원 수집 누적 중복"})
             continue
 
+        # 1. 반려동물 글 제외 (제목+요약+작성자 검사)
+        pet_check = title + " " + snippet + " " + author
+        found_pet = [w for w in pet_words if w in pet_check]
+        if found_pet:
+            stats["pet"] += 1
+            excluded_items.append({**item, "제외사유": "반려동물 글 (" + ", ".join(found_pet) + ")"})
+            continue
+
+        # 2. 기업 블로그 제외 (작성자에 "공식" 포함)
+        if "공식" in author:
+            stats["corporate"] += 1
+            excluded_items.append({**item, "제외사유": "기업 블로그 (작성자: " + author + ")"})
+            continue
+
+        # 3. 광고 금지어
         found_ad = [w for w in ad_words if w in full_text]
         if found_ad:
             stats["ad"] += 1
-            excluded_items.append({**item, "제외사유": f"광고 의심 ({', '.join(found_ad)})"})
+            excluded_items.append({**item, "제외사유": "광고 의심 (" + ", ".join(found_ad) + ")"})
             continue
 
+        # 3-2. 체험단 N기 패턴 (예: 이너프렌즈3기, 맘서포터즈2기)
+        campaign_match = re.search(r'[가-힣]+\d+기', full_text)
+        if campaign_match:
+            stats["ad"] += 1
+            excluded_items.append({**item, "제외사유": "광고 의심 - 체험단 활동 (" + campaign_match.group() + ")"})
+            continue
+
+        # 4. 정보글 제외어 (제목 기준)
         found_info = [w for w in info_words if w in title]
         if found_info:
             stats["info"] += 1
-            excluded_items.append({**item, "제외사유": f"정보성 글 의심 ({', '.join(found_info)})"})
+            excluded_items.append({**item, "제외사유": "정보성 글 (" + ", ".join(found_info) + ")"})
             continue
 
+        # 5. 육아 필수어 (Reddit은 영문 포함)
         is_reddit = "Reddit" in item.get("채널", "")
-        check_words = req_words
+        check_words = list(req_words)
         if is_reddit:
-            check_words = req_words + ["baby", "toddler", "infant", "kid", "child", "mom", "dad", "sleep", "food", "feed", "cry"]
+            check_words = check_words + ["baby", "toddler", "infant", "kid", "child", "mom", "dad", "sleep", "food", "feed", "cry"]
 
         if check_words:
             found_req = [w for w in check_words if w.lower() in full_text.lower()]
@@ -133,16 +172,25 @@ def filter_and_process(items: List[Dict[str, Any]], filters: Dict[str, Any], exc
                 excluded_items.append({**item, "제외사유": "육아 필수어 미포함"})
                 continue
 
+        # 6. 최소 글자 수
         if len(snippet.strip()) < min_length:
             stats["short"] += 1
-            excluded_items.append({**item, "제외사유": f"최소 글자 수 미달 ({len(snippet.strip())}자)"})
+            excluded_items.append({**item, "제외사유": "최소 글자 수 미달 (" + str(len(snippet.strip())) + "자)"})
             continue
 
+        # 7. 해시태그 과다 표시 (제외하지 않고 표시만)
+        hashtag_count = snippet.count("#")
+        promo_flag = ""
+        if hashtag_count >= 5:
+            promo_flag = "해시태그 과다"
+        item["홍보의심"] = promo_flag
+
+        # 8. 이번 수집 내 중복
         if norm_url in valid_dict:
             stats["dup"] += 1
             existing = valid_dict[norm_url]
             if item["검색식"] not in existing["검색식"]:
-                existing["검색식"] = f"{existing['검색식']} | {item['검색식']}"
+                existing["검색식"] = existing["검색식"] + " | " + item["검색식"]
         else:
             valid_dict[norm_url] = item
 
@@ -150,55 +198,111 @@ def filter_and_process(items: List[Dict[str, Any]], filters: Dict[str, Any], exc
     stats["saved"] = len(valid_items)
     return valid_items, excluded_items, stats
 
-def create_zip_package(valid_items: List[Dict[str, Any]], excluded_items: List[Dict[str, Any]], time_tag: str, worker: str = "") -> Tuple[bytes, str]:
+def create_zip_package(valid_items, excluded_items, time_tag, worker=""):
     ensure_data_dir()
     zip_buffer = io.BytesIO()
 
-    cols = ["채널", "검색식", "제목", "본문요약", "본문전체", "작성자", "작성일", "URL", "수집일시"]
+    cols = ["채널", "검색식", "제목", "본문요약", "본문전체", "작성자", "작성일", "URL", "수집일시", "홍보의심"]
     valid_df = pd.DataFrame(valid_items)
     for c in cols:
-        if c not in valid_df.columns: valid_df[c] = ""
+        if c not in valid_df.columns:
+            valid_df[c] = ""
     valid_df = valid_df[cols]
 
-    ex_cols = ["채널", "검색식", "제목", "URL", "제외사유"]
+    ex_cols = ["채널", "검색식", "제목", "작성자", "URL", "제외사유"]
     excluded_df = pd.DataFrame(excluded_items)
     for c in ex_cols:
-        if c not in excluded_df.columns: excluded_df[c] = ""
+        if c not in excluded_df.columns:
+            excluded_df[c] = ""
     excluded_df = excluded_df[ex_cols]
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("수집결과.csv", valid_df.to_csv(index=False, encoding="utf-8-sig"))
         zf.writestr("제외된글.csv", excluded_df.to_csv(index=False, encoding="utf-8-sig"))
-        md_table = simple_df_to_markdown(valid_df[["채널", "검색식", "제목", "작성자", "작성일", "URL"]])
+
+        md_cols = ["채널", "검색식", "제목", "본문요약", "작성자", "작성일", "URL", "홍보의심"]
+        md_table = simple_df_to_markdown(valid_df[md_cols])
         zf.writestr("수집결과.md", "# 육아 소셜 리스닝 수집 결과 (" + time_tag + ")\n\n" + md_table)
 
         for i, row in valid_df.iterrows():
             safe_title = re.sub(r'[\/:*?"<>|]', '_', str(row["제목"]))[:30].strip()
-            fname = f"notes/{row['채널']}_{i+1}_{safe_title}.md"
+            fname = "notes/" + str(row["채널"]) + "_" + str(i+1) + "_" + safe_title + ".md"
             note_content = (
                 "---\n"
-                f"title: {row['제목']}\n"
-                f"channel: {row['채널']}\n"
-                f"author: {row['작성자']}\n"
-                f"date: {row['작성일']}\n"
-                f"url: {row['URL']}\n"
-                f"keyword: {row['검색식']}\n"
-                f"collected_at: {row['수집일시']}\n"
+                "title: " + str(row["제목"]) + "\n"
+                "channel: " + str(row["채널"]) + "\n"
+                "author: " + str(row["작성자"]) + "\n"
+                "date: " + str(row["작성일"]) + "\n"
+                "url: " + str(row["URL"]) + "\n"
+                "keyword: " + str(row["검색식"]) + "\n"
+                "collected_at: " + str(row["수집일시"]) + "\n"
                 "---\n\n"
-                f"# {row['제목']}\n\n"
-                "### 본문 요약\n"
-                f"{row['본문요약']}\n\n"
-                "### 본문 전체\n"
-                f"{row['본문전체']}\n"
+                "# " + str(row["제목"]) + "\n\n"
+                "### 본문 요약\n" + str(row["본문요약"]) + "\n\n"
+                "### 본문 전체\n" + str(row["본문전체"]) + "\n"
             )
             zf.writestr(fname, note_content)
 
     zip_bytes = zip_buffer.getvalue()
     safe_worker = re.sub(r'[\/:*?"<>|]', '', worker)[:10].strip() or "팀원"
-    zip_filename = f"육아수집_{time_tag}_{safe_worker}.zip"
+    zip_filename = "육아수집_" + time_tag + "_" + safe_worker + ".zip"
 
     archive_path = os.path.join(ARCHIVE_DIR, zip_filename)
     with open(archive_path, "wb") as f:
         f.write(zip_bytes)
 
+    return zip_bytes, zip_filename
+
+def create_cumulative_zip():
+    ensure_data_dir()
+    if not os.path.exists(MASTER_FILE):
+        return None, None
+
+    try:
+        master_df = pd.read_csv(MASTER_FILE, encoding="utf-8-sig")
+    except Exception:
+        return None, None
+
+    if master_df.empty:
+        return None, None
+
+    time_tag = datetime.now().strftime("%Y%m%d_%H%M")
+    zip_buffer = io.BytesIO()
+
+    all_cols = ["채널", "검색식", "제목", "본문요약", "본문전체", "작성자", "작성일", "URL", "수집일시"]
+    for c in all_cols:
+        if c not in master_df.columns:
+            master_df[c] = ""
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("전체누적_수집결과.csv", master_df.to_csv(index=False, encoding="utf-8-sig"))
+
+        md_cols = ["채널", "검색식", "제목", "본문요약", "작성자", "작성일", "URL"]
+        for c in md_cols:
+            if c not in master_df.columns:
+                master_df[c] = ""
+        md_table = simple_df_to_markdown(master_df[md_cols])
+        zf.writestr("전체누적_수집결과.md", "# 전체 누적 수집 결과 (" + time_tag + ")\n\n" + md_table)
+
+        for i, row in master_df.iterrows():
+            safe_title = re.sub(r'[\/:*?"<>|]', '_', str(row.get("제목", "")))[:30].strip()
+            fname = "notes/" + str(row.get("채널", "")) + "_" + str(i+1) + "_" + safe_title + ".md"
+            note_content = (
+                "---\n"
+                "title: " + str(row.get("제목", "")) + "\n"
+                "channel: " + str(row.get("채널", "")) + "\n"
+                "author: " + str(row.get("작성자", "")) + "\n"
+                "date: " + str(row.get("작성일", "")) + "\n"
+                "url: " + str(row.get("URL", "")) + "\n"
+                "keyword: " + str(row.get("검색식", "")) + "\n"
+                "collected_at: " + str(row.get("수집일시", "")) + "\n"
+                "---\n\n"
+                "# " + str(row.get("제목", "")) + "\n\n"
+                "### 본문 요약\n" + str(row.get("본문요약", "")) + "\n\n"
+                "### 본문 전체\n" + str(row.get("본문전체", "")) + "\n"
+            )
+            zf.writestr(fname, note_content)
+
+    zip_bytes = zip_buffer.getvalue()
+    zip_filename = "전체누적결과_" + time_tag + ".zip"
     return zip_bytes, zip_filename
