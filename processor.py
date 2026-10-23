@@ -8,11 +8,13 @@ from urllib.parse import urlsplit, urlunsplit
 from typing import List, Dict, Any, Tuple
 
 DATA_DIR = "data"
+ARCHIVE_DIR = os.path.join(DATA_DIR, "archives")
 HISTORY_FILE = os.path.join(DATA_DIR, "collection_history.csv")
 MASTER_FILE = os.path.join(DATA_DIR, "master_database.csv")
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
 def normalize_url(url: str) -> str:
     if not url:
@@ -33,13 +35,26 @@ def load_master_urls() -> set:
 
 def load_history() -> pd.DataFrame:
     ensure_data_dir()
-    cols = ["수집일시", "작업자", "채널", "검색식", "요청건수", "총수집", "광고제외", "정보글제외", "무관제외", "중복제외", "최종저장"]
+    cols = ["수집일시", "작업자", "채널", "검색식", "요청건수", "총수집", "광고제외", "정보글제외", "무관제외", "중복제외", "최종저장", "파일명"]
     if os.path.exists(HISTORY_FILE):
         try:
-            return pd.read_csv(HISTORY_FILE, encoding="utf-8-sig")
+            df = pd.read_csv(HISTORY_FILE, encoding="utf-8-sig")
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = ""
+            return df
         except Exception:
             return pd.DataFrame(columns=cols)
     return pd.DataFrame(columns=cols)
+
+def get_archive_file(filename: str):
+    """보관소에서 특정 회차의 zip 파일 데이터를 읽어옵니다."""
+    ensure_data_dir()
+    path = os.path.join(ARCHIVE_DIR, filename)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return f.read()
+    return None
 
 def save_to_master_and_history(valid_items: List[Dict[str, Any]], history_record: Dict[str, Any]):
     ensure_data_dir()
@@ -107,7 +122,6 @@ def filter_and_process(items: List[Dict[str, Any]], filters: Dict[str, Any], exc
             excluded_items.append({**item, "제외사유": f"정보성 글 의심 ({', '.join(found_info)})"})
             continue
 
-        # 해외 포럼(Reddit)일 경우 영문 육아 필수어 함께 검사
         is_reddit = "Reddit" in item.get("채널", "")
         check_words = req_words
         if is_reddit:
@@ -137,8 +151,11 @@ def filter_and_process(items: List[Dict[str, Any]], filters: Dict[str, Any], exc
     stats["saved"] = len(valid_items)
     return valid_items, excluded_items, stats
 
-def create_zip_package(valid_items: List[Dict[str, Any]], excluded_items: List[Dict[str, Any]], time_tag: str) -> bytes:
+def create_zip_package(valid_items: List[Dict[str, Any]], excluded_items: List[Dict[str, Any]], time_tag: str, worker: str = "") -> Tuple[bytes, str]:
+    """결과 zip 파일을 만들고, 보관소 폴더에도 영구 저장합니다."""
+    ensure_data_dir()
     zip_buffer = io.BytesIO()
+
     cols = ["채널", "검색식", "제목", "본문요약", "본문전체", "작성자", "작성일", "URL", "수집일시"]
     valid_df = pd.DataFrame(valid_items)
     for c in cols:
@@ -178,4 +195,13 @@ def create_zip_package(valid_items: List[Dict[str, Any]], excluded_items: List[D
             )
             zf.writestr(fname, note_content)
 
-    return zip_buffer.getvalue()
+    zip_bytes = zip_buffer.getvalue()
+    safe_worker = re.sub(r'[\/:*?"<>|]', '', worker)[:10].strip() or "팀원"
+    zip_filename = f"육아수집_{time_tag}_{safe_worker}.zip"
+
+    # 보관소 폴더에 저장
+    archive_path = os.path.join(ARCHIVE_DIR, zip_filename)
+    with open(archive_path, "wb") as f:
+        f.write(zip_bytes)
+
+    return zip_bytes, zip_filename

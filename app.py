@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from channel_registry import get_all_channels
-from processor import filter_and_process, create_zip_package, load_history, save_to_master_and_history, load_master_urls
+from processor import filter_and_process, create_zip_package, load_history, save_to_master_and_history, load_master_urls, get_archive_file
 
 st.set_page_config(page_title="육아 소셜 리스닝 수집기", page_icon="👶", layout="wide")
 
@@ -32,7 +32,6 @@ with col_info:
     master_count = len(load_master_urls())
     st.info(f"📊 현재 우리 팀 누적 마스터 보관함에 **{master_count}건**의 고유 글이 보관되어 있습니다.")
 
-# 검색식 세션 상태 초기화
 if "keyword_text" not in st.session_state:
     st.session_state.keyword_text = """이유식 거부
 신생아 통잠 안자요
@@ -40,42 +39,37 @@ if "keyword_text" not in st.session_state:
 아기 열 응급실
 어린이집 적응 울음"""
 
-# 💡 키워드 번들 조합기 (AND / OR 마법사)
+# 💡 키워드 번들 조합기
 with st.expander("🧩 [추천] 키워드 번들 조합기 (AND / OR 자동 생성기)"):
     st.caption("주제어(AND)와 다양한 상황/고민어(OR)를 넣으면 고효율 검색식을 자동으로 조합해 줍니다.")
     b_col1, b_col2 = st.columns(2)
     with b_col1:
-        group_a = st.text_input("📌 필수 주제어 (AND)", value="이유식", help="반드시 들어가야 할 단어 (예: 이유식, 분유, 어린이집)")
+        group_a = st.text_input("📌 필수 주제어 (AND)", value="이유식")
     with b_col2:
-        group_b = st.text_input("🔀 상황/고민 키워드들 (OR - 쉼표로 구분)", value="거부, 안먹어요, 뱉음, 울음, 입꾹닫", help="이 중 하나라도 걸리면 되는 유의어들")
+        group_b = st.text_input("🔀 상황/고민 키워드들 (OR - 쉼표로 구분)", value="거부, 안먹어요, 뱉음, 울음, 입꾹닫")
     
     if st.button("👉 번들 검색식 생성해서 아래 입력창에 넣기"):
         a_words = [w.strip() for w in group_a.split(",") if w.strip()]
         b_words = [w.strip() for w in group_b.split(",") if w.strip()]
-        new_bundles = []
-        for a in a_words:
-            for b in b_words:
-                new_bundles.append(f"{a} {b}")
+        new_bundles = [f"{a} {b}" for a in a_words for b in b_words]
         if new_bundles:
             st.session_state.keyword_text = "\n".join(new_bundles)
-            st.success(f"총 {len(new_bundles)}개의 고효율 번들 검색식이 생성되었습니다!")
+            st.success(f"총 {len(new_bundles)}개의 번들 검색식이 생성되었습니다!")
             st.rerun()
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
     st.subheader("1. 검색식 입력 (한 줄에 하나씩)")
-    st.caption("💡 팁: 띄어쓰기는 AND / 한 줄에 '단어A | 단어B'를 넣으면 OR로 자동 분리 수집됩니다.")
+    st.caption("💡 팁: 띄어쓰기는 AND / '단어A | 단어B'는 OR로 자동 분리 수집됩니다.")
     keyword_text = st.text_area("검색어 목록", value=st.session_state.keyword_text, height=140)
     st.session_state.keyword_text = keyword_text
 
-    # 검색식 파싱 (OR 연산자 | 처리 포함)
     raw_lines = [k.strip() for k in keyword_text.splitlines() if k.strip()]
     keywords = []
     for line in raw_lines:
         if "|" in line:
-            parts = [p.strip() for p in line.split("|") if p.strip()]
-            keywords.extend(parts)
+            keywords.extend([p.strip() for p in line.split("|") if p.strip()])
         else:
             keywords.append(line)
 
@@ -146,8 +140,11 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
     status_text.write("🧹 글 정제 및 팀원 누적 중복 검사 중...")
     valid_items, excluded_items, stats = filter_and_process(all_raw_items, filter_config, exclude_master_dup)
 
+    time_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_bytes, zip_filename = create_zip_package(valid_items, excluded_items, time_tag, worker=worker_name)
+
     history_record = {
-        "수집일시": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "수집일시": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "작업자": worker_name,
         "채널": ", ".join([c.name for c in selected_channels]),
         "검색식": " / ".join(keywords[:2]) + (f" 외 {len(keywords)-2}개" if len(keywords) > 2 else ""),
@@ -157,7 +154,8 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
         "정보글제외": stats["info"],
         "무관제외": stats["irrelevant"],
         "중복제외": stats["dup"] + stats["master_dup"],
-        "최종저장": stats["saved"]
+        "최종저장": stats["saved"],
+        "파일명": zip_filename
     }
     save_to_master_and_history(valid_items, history_record)
 
@@ -168,29 +166,50 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
 
     st.session_state.valid_items = valid_items
     st.session_state.excluded_items = excluded_items
+    st.session_state.last_zip_bytes = zip_bytes
+    st.session_state.last_zip_name = zip_filename
 
-# 6. 결과 표 및 다운로드
+# 6. 방금 수집한 결과 미리보기 및 즉시 다운로드
 if "valid_items" in st.session_state and st.session_state.valid_items:
-    st.subheader(f"📋 수집 결과 미리보기 ({len(st.session_state.valid_items)}건)")
+    st.subheader(f"📋 방금 수집된 결과 미리보기 ({len(st.session_state.valid_items)}건)")
     df_preview = pd.DataFrame(st.session_state.valid_items)[["채널", "검색식", "제목", "작성자", "작성일", "URL"]]
     st.dataframe(df_preview, use_container_width=True)
 
-    time_tag = datetime.now().strftime("%Y%m%d_%H%M")
-    zip_bytes = create_zip_package(st.session_state.valid_items, st.session_state.get("excluded_items", []), time_tag)
-
     st.download_button(
-        label=f"💾 결과 전체 다운로드 (육아수집_{time_tag}.zip)",
-        data=zip_bytes,
-        file_name=f"육아수집_{time_tag}.zip",
+        label=f"💾 방금 수집한 결과 즉시 다운로드 ({st.session_state.last_zip_name})",
+        data=st.session_state.last_zip_bytes,
+        file_name=st.session_state.last_zip_name,
         mime="application/zip",
         type="primary"
     )
 
-# 7. 팀 누적 수집 이력 장부
+# 7. ⭐️ 회차별 누적 이력 및 개별 다시 다운로드 보관함 ⭐️
 st.divider()
-st.subheader("📜 우리 팀 누적 수집 이력 장부")
-history_df = load_history()
-if not history_df.empty:
-    st.dataframe(history_df, use_container_width=True)
+st.subheader("📦 우리 팀 누적 수집 이력 & 회차별 다시 다운로드 보관함")
+st.caption("새로고침을 하거나 나중에 다시 들어와도, 과거에 수집했던 회차별 zip 파일을 언제든지 각각 다시 다운로드할 수 있습니다.")
+
+hist_df = load_history()
+if not hist_df.empty:
+    for idx, row in hist_df.iterrows():
+        with st.container():
+            col_t, col_w, col_k, col_cnt, col_btn = st.columns([2, 1, 3, 1, 2])
+            col_t.write(f"🕒 **{row.get('수집일시', '')}**")
+            col_w.write(f"👤 {row.get('작업자', '')}")
+            col_k.write(f"🔍 {row.get('검색식', '')}")
+            col_cnt.write(f"📊 **{row.get('최종저장', 0)}건**")
+
+            fname = row.get("파일명", "")
+            file_data = get_archive_file(fname) if fname else None
+            if file_data:
+                col_btn.download_button(
+                    label=f"💾 {row.get('최종저장', 0)}건 받기",
+                    data=file_data,
+                    file_name=fname,
+                    mime="application/zip",
+                    key=f"archive_dl_{idx}_{fname}"
+                )
+            else:
+                col_btn.caption("파일 없음")
+            st.divider()
 else:
-    st.caption("아직 기록된 수집 이력이 없습니다. 수집을 시작하면 자동으로 기록됩니다.")
+    st.info("아직 기록된 수집 이력이 없습니다. 수집을 시작하면 회차별로 다운로드 버튼이 생겨납니다.")
