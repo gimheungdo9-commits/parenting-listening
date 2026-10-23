@@ -7,6 +7,13 @@ from processor import (filter_and_process, create_zip_package, load_history,
                         save_to_master_and_history, load_master_urls,
                         get_archive_file, create_cumulative_zip, read_list_summary)
 from fulltext import enrich_full_text, mark_fetch_off, DEFAULT_BODY_AD_WORDS
+from storage import make_store, set_store, get_store, get_store_warning
+
+
+@st.cache_resource(show_spinner="📒 누적 장부에 연결하는 중...")
+def _connect_store():
+    # 서버가 켜져 있는 동안 한 번만 연결하고, 팀원 모두가 같은 연결을 씁니다.
+    return make_store(st.secrets)
 
 def translate_to_english(kw_list):
     result = {}
@@ -48,22 +55,40 @@ if not st.session_state.authenticated:
             st.error("비밀번호가 올바르지 않습니다.")
     st.stop()
 
+# 📒 누적 장부 연결 (구글 시트 또는 이 컴퓨터)
+_store, _store_warning = _connect_store()
+set_store(_store, _store_warning)
+if _store_warning:
+    _connect_store.clear()  # 연결에 실패했으면 다음에 화면을 누를 때 다시 시도
+
 # 2. 메인 헤더 & 작업자 정보
 st.title("👶 육아 소셜 리스닝 수집기")
+if _store_warning:
+    st.warning("⚠️ " + _store_warning + "  → 지금은 **이 컴퓨터(data 폴더)**에 저장합니다.")
 col_user, col_info, col_cum = st.columns([1, 2, 1])
 with col_user:
     worker_name = st.text_input("👤 작업자 이름", value="팀원1")
 with col_info:
-    master_count = len(load_master_urls())
-    st.info("📊 누적 마스터 보관함: **" + str(master_count) + "건**")
+    try:
+        master_count = len(load_master_urls())
+    except Exception as e:
+        master_count = 0
+        st.error("누적 장부를 읽지 못했어요: " + type(e).__name__)
+    st.info("📊 누적 마스터 보관함: **" + str(master_count) + "건**  ·  저장 위치: " + get_store().label)
+    sheet_url = st.secrets.get("SHEET_URL", "") if get_store().kind == "sheet" else ""
+    if sheet_url:
+        st.caption("📄 [팀 공용 구글 시트 열기](" + sheet_url + ") — '직접읽을글' 탭에서 읽음여부·메모를 바로 적을 수 있어요.")
 with col_cum:
     if master_count > 0:
-        cum_zip, cum_name = create_cumulative_zip()
-        if cum_zip:
+        # 누를 때만 만듭니다 (매번 만들면 화면이 느려져요)
+        if st.button("📦 전체 누적 파일 만들기"):
+            with st.spinner("전체 누적 파일을 만드는 중..."):
+                st.session_state.cum_zip, st.session_state.cum_name = create_cumulative_zip()
+        if st.session_state.get("cum_zip"):
             st.download_button(
-                label="📦 전체 누적 다운로드",
-                data=cum_zip,
-                file_name=cum_name,
+                label="💾 " + st.session_state.cum_name + " 받기",
+                data=st.session_state.cum_zip,
+                file_name=st.session_state.cum_name,
                 mime="application/zip"
             )
 
@@ -309,7 +334,13 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
         "직접읽을글": read_count,
         "파일명": zip_filename
     }
-    save_to_master_and_history(valid_items, history_record)
+    status_text.write("📒 누적 장부에 저장하는 중...")
+    try:
+        save_to_master_and_history(valid_items, history_record, excluded_items, run_id=zip_filename)
+    except Exception as e:
+        st.error("⚠️ 누적 장부 저장에 실패했어요 (" + type(e).__name__ + "). "
+                 "결과 파일은 아래에서 받을 수 있으니 꼭 내려받아 두세요.")
+    st.session_state.pop("cum_zip", None)  # 전체 누적 파일은 새로 만들어야 함
     progress_bar.progress(1.0)
 
     # 제외 사유별 상세 요약
@@ -359,26 +390,31 @@ if "valid_items" in st.session_state and st.session_state.valid_items:
 # 7. 회차별 이력 및 보관함
 st.divider()
 st.subheader("📦 팀 누적 수집 이력 & 회차별 다운로드")
-hist_df = load_history()
+try:
+    hist_df = load_history()
+except Exception as e:
+    hist_df = pd.DataFrame()
+    st.error("수집 이력을 읽지 못했어요: " + type(e).__name__)
+
 if not hist_df.empty:
-    for idx, row in hist_df.iterrows():
-        with st.container():
-            ct, cw, ck, cc, cb = st.columns([2, 1, 3, 1, 2])
-            ct.write("🕒 **" + str(row.get("수집일시", "")) + "**")
-            cw.write("👤 " + str(row.get("작업자", "")))
-            ck.write("🔍 " + str(row.get("검색식", "")))
-            cc.write("📊 **" + str(row.get("최종저장", 0)) + "건**")
-            fname = row.get("파일명", "")
-            file_data = get_archive_file(fname) if fname else None
-            if file_data:
-                cb.download_button(
-                    label="💾 " + str(row.get("최종저장", 0)) + "건 받기",
-                    data=file_data, file_name=fname,
-                    mime="application/zip",
-                    key="archive_" + str(idx) + "_" + str(fname)
-                )
+    show_cols = [c for c in ["수집일시", "작업자", "검색식", "채널", "최종저장", "직접읽을글", "파일명"] if c in hist_df.columns]
+    st.dataframe(hist_df[show_cols], use_container_width=True, hide_index=True)
+
+    run_names = [f for f in hist_df.get("파일명", pd.Series(dtype=str)).astype(str).tolist() if f]
+    if run_names:
+        rc1, rc2 = st.columns([3, 1])
+        with rc1:
+            picked = st.selectbox("📥 받고 싶은 회차 고르기", run_names, label_visibility="collapsed")
+        with rc2:
+            if st.button("📦 이 회차 파일 만들기"):
+                with st.spinner("회차 파일을 만드는 중..."):
+                    st.session_state.run_zip = get_archive_file(picked)
+                    st.session_state.run_zip_name = picked
+        if st.session_state.get("run_zip_name") == picked:
+            if st.session_state.get("run_zip"):
+                st.download_button("💾 " + picked + " 받기", data=st.session_state.run_zip,
+                                   file_name=picked, mime="application/zip")
             else:
-                cb.caption("파일 없음")
-            st.divider()
+                st.caption("이 회차는 장부에 남은 글이 없어요 (전부 중복이었거나, 예전 방식으로 저장된 회차예요).")
 else:
     st.info("아직 수집 이력이 없습니다. 수집을 시작하면 회차별로 기록됩니다.")

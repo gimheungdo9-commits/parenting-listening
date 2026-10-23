@@ -7,20 +7,12 @@ from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
 from typing import List, Dict, Any, Tuple
 from fulltext import STATUS_MEMBERS, to_json_str
-
-DATA_DIR = "data"
+from storage import get_store
 
 # 결과 파일 칸 구성 (한 곳에서 관리)
 RESULT_COLS = ["채널", "검색식", "제목", "본문요약", "본문전체", "본문상태", "작성자", "작성일", "URL", "수집일시", "홍보의심"]
 MD_COLS = ["채널", "검색식", "제목", "본문요약", "본문상태", "작성자", "작성일", "URL", "홍보의심"]
 READ_LIST_COLS = ["카페명", "제목", "요약", "URL", "검색식", "읽음여부", "메모"]
-ARCHIVE_DIR = os.path.join(DATA_DIR, "archives")
-HISTORY_FILE = os.path.join(DATA_DIR, "collection_history.csv")
-MASTER_FILE = os.path.join(DATA_DIR, "master_database.csv")
-
-def ensure_data_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
 # 주소 뒤에 붙는 추적용 값 (같은 글인데 주소만 달라지게 만드는 것들)
 TRACKING_PARAMS = {
@@ -62,65 +54,75 @@ def normalize_url(url):
     return urlunsplit(("https", host, parts.path.rstrip("/"), urlencode(keep), ""))
 
 def load_master_urls():
-    ensure_data_dir()
-    if os.path.exists(MASTER_FILE):
-        try:
-            df = pd.read_csv(MASTER_FILE, encoding="utf-8-sig")
-            return set(df["URL"].dropna().apply(normalize_url))
-        except Exception:
-            return set()
-    return set()
+    df = get_store().load_master()
+    if df.empty or "URL" not in df.columns:
+        return set()
+    return set(u for u in df["URL"].map(normalize_url) if u)
+
 
 def load_master_df():
-    ensure_data_dir()
-    if os.path.exists(MASTER_FILE):
-        try:
-            return pd.read_csv(MASTER_FILE, encoding="utf-8-sig")
-        except Exception:
-            return pd.DataFrame()
-    return pd.DataFrame()
+    return get_store().load_master()
+
 
 def load_history():
-    ensure_data_dir()
-    cols = ["수집일시", "작업자", "채널", "검색식", "요청건수", "총수집", "광고제외", "정보글제외", "반려동물제외", "기업블로그제외", "무관제외", "중복제외", "본문광고제외", "최종저장", "직접읽을글", "파일명"]
-    if os.path.exists(HISTORY_FILE):
-        try:
-            df = pd.read_csv(HISTORY_FILE, encoding="utf-8-sig")
-            for c in cols:
-                if c not in df.columns:
-                    df[c] = ""
-            return df
-        except Exception:
-            return pd.DataFrame(columns=cols)
-    return pd.DataFrame(columns=cols)
+    return get_store().load_history()
 
-def get_archive_file(filename):
-    ensure_data_dir()
-    path = os.path.join(ARCHIVE_DIR, filename)
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            return f.read()
-    return None
 
-def save_to_master_and_history(valid_items, history_record):
-    ensure_data_dir()
+def save_to_master_and_history(valid_items, history_record, excluded_items=None, run_id=""):
+    """
+    이번 수집 결과를 누적 장부에 더합니다.
+    - 장부에 이미 있는 글(같은 주소)은 다시 넣지 않습니다.
+    - 회원전용 카페 글은 '직접읽을글' 목록에도 넣습니다 (이미 있으면 건너뜀).
+    """
+    store = get_store()
+    run_id = run_id or history_record.get("파일명", "")
+
     if valid_items:
         new_df = pd.DataFrame(valid_items)
-        if os.path.exists(MASTER_FILE):
-            try:
-                old_df = pd.read_csv(MASTER_FILE, encoding="utf-8-sig")
-                combined = pd.concat([old_df, new_df], ignore_index=True)
-                combined.drop_duplicates(subset=["URL"], keep="first", inplace=True)
-                combined.to_csv(MASTER_FILE, index=False, encoding="utf-8-sig")
-            except Exception:
-                new_df.to_csv(MASTER_FILE, index=False, encoding="utf-8-sig")
-        else:
-            new_df.to_csv(MASTER_FILE, index=False, encoding="utf-8-sig")
+        new_df["회차ID"] = run_id
+        new_df["_norm"] = new_df["URL"].map(normalize_url)
+        existing = load_master_urls()
+        new_df = new_df[~new_df["_norm"].isin(existing)].drop_duplicates("_norm").drop(columns="_norm")
+        store.append_master(new_df)
 
-    hist_df = load_history()
-    new_row = pd.DataFrame([history_record])
-    updated = pd.concat([new_row, hist_df], ignore_index=True)
-    updated.to_csv(HISTORY_FILE, index=False, encoding="utf-8-sig")
+        read_df = build_read_list(_prepare_df(valid_items, RESULT_COLS))
+        if not read_df.empty:
+            read_df["회차ID"] = run_id
+            old_read = store.load_read_list()
+            old_urls = set(old_read["URL"].map(normalize_url)) if not old_read.empty else set()
+            read_df = read_df[~read_df["URL"].map(normalize_url).isin(old_urls)]
+            store.append_read_list(read_df)
+
+    if excluded_items:
+        ex_df = pd.DataFrame(excluded_items)
+        ex_df["회차ID"] = run_id
+        store.append_excluded(ex_df)
+
+    store.append_history(pd.DataFrame([history_record]))
+    store.clear_cache()
+
+
+def get_archive_file(filename):
+    """회차별 결과 zip. 이 컴퓨터에 저장된 파일이 있으면 그걸, 없으면 장부에서 다시 만듭니다."""
+    if not filename:
+        return None
+    store = get_store()
+    data = store.get_archive(filename)
+    if data:
+        return data
+    master = store.load_master()
+    if master.empty or "회차ID" not in master.columns:
+        return None
+    run_rows = master[master["회차ID"] == filename]
+    if run_rows.empty:
+        return None
+    excluded = store.load_excluded()
+    if not excluded.empty and "회차ID" in excluded.columns:
+        excluded = excluded[excluded["회차ID"] == filename]
+    tag = filename.replace("육아수집_", "").replace(".zip", "")
+    data, _ = _build_zip(run_rows, excluded, tag)
+    return data
+
 
 def simple_df_to_markdown(df):
     headers = list(df.columns)
@@ -307,14 +309,12 @@ def _write_notes(zf, df):
         zf.writestr(fname, _note_content(row))
 
 
-def create_zip_package(valid_items, excluded_items, time_tag, worker=""):
-    ensure_data_dir()
+def _build_zip(valid_items_or_df, excluded_items_or_df, time_tag):
     zip_buffer = io.BytesIO()
-
-    valid_df = _prepare_df(valid_items, RESULT_COLS)[RESULT_COLS].reset_index(drop=True)
+    valid_df = _prepare_df(valid_items_or_df, RESULT_COLS)[RESULT_COLS].reset_index(drop=True)
 
     ex_cols = ["채널", "검색식", "제목", "작성자", "URL", "제외사유"]
-    excluded_df = _prepare_df(excluded_items, ex_cols)[ex_cols]
+    excluded_df = _prepare_df(excluded_items_or_df, ex_cols)[ex_cols]
 
     read_df = build_read_list(valid_df)
 
@@ -328,26 +328,24 @@ def create_zip_package(valid_items, excluded_items, time_tag, worker=""):
 
         _write_notes(zf, valid_df)
 
-    zip_bytes = zip_buffer.getvalue()
-    safe_worker = re.sub(r'[\/:*?"<>|]', '', worker)[:10].strip() or "팀원"
-    zip_filename = "육아수집_" + time_tag + "_" + safe_worker + ".zip"
+    return zip_buffer.getvalue(), read_df
 
-    archive_path = os.path.join(ARCHIVE_DIR, zip_filename)
-    with open(archive_path, "wb") as f:
-        f.write(zip_bytes)
 
+def make_zip_filename(time_tag, worker=""):
+    safe_worker = re.sub(r'[\\/:*?"<>|]', '', worker)[:10].strip() or "팀원"
+    return "육아수집_" + time_tag + "_" + safe_worker + ".zip"
+
+
+def create_zip_package(valid_items, excluded_items, time_tag, worker=""):
+    zip_bytes, _ = _build_zip(valid_items, excluded_items, time_tag)
+    zip_filename = make_zip_filename(time_tag, worker)
+    get_store().save_archive(zip_filename, zip_bytes)
     return zip_bytes, zip_filename
 
+
 def create_cumulative_zip():
-    ensure_data_dir()
-    if not os.path.exists(MASTER_FILE):
-        return None, None
-
-    try:
-        master_df = pd.read_csv(MASTER_FILE, encoding="utf-8-sig")
-    except Exception:
-        return None, None
-
+    store = get_store()
+    master_df = store.load_master()
     if master_df.empty:
         return None, None
 
@@ -355,7 +353,10 @@ def create_cumulative_zip():
     zip_buffer = io.BytesIO()
 
     master_df = _prepare_df(master_df, RESULT_COLS).reset_index(drop=True)
-    read_df = build_read_list(master_df)
+    # 직접 읽을 글은 팀원들이 적은 읽음여부·메모가 있는 장부 쪽을 우선 사용
+    read_df = store.load_read_list()
+    if read_df.empty:
+        read_df = build_read_list(master_df)
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("전체누적_수집결과.csv", master_df.to_csv(index=False, encoding="utf-8-sig"))
