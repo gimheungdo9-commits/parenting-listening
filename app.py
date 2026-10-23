@@ -143,7 +143,7 @@ with col1:
     max_count = st.slider("검색식당 최대 수집 건수", 10, 1000, 100, 10)
     sort_option = st.radio("정렬 기준", ["정확도순", "최신순"], horizontal=True)
     exclude_master_dup = st.checkbox("👥 이전 팀원 수집 중복 제외", value=True)
-    auto_translate = st.checkbox("🌐 한글→영어 자동 번역 (해외 채널 동시 검색)", value=True)
+    auto_translate = st.checkbox("🌐 한글→영어 자동 번역 (Reddit 검색용)", value=True)
     fetch_full = st.checkbox("📄 본문 전체 가져오기 (블로그·지식iN·공개 카페글)", value=True,
                              help="필터를 통과한 글만 본문을 가져옵니다. 글마다 1~2초씩 쉬어서 시간이 걸려요. "
                                   "회원전용 카페 글은 가져오지 않고 '직접 읽을 글' 목록으로 보냅니다.")
@@ -166,7 +166,7 @@ with col2:
 
 # 🌐 번역 미리보기 & 캐시
 if auto_translate and keywords:
-    has_intl = any("Reddit" in c.name or "유튜브" in c.name for c in selected_channels)
+    has_intl = any("Reddit" in c.name for c in selected_channels)
     if has_intl:
         kw_key = "|".join(sorted(keywords))
         if st.session_state.get("cached_kw_key") != kw_key:
@@ -228,7 +228,7 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
 
     # 번역 준비
     translations = {}
-    has_intl = any("Reddit" in c.name or "유튜브" in c.name for c in selected_channels)
+    has_intl = any("Reddit" in c.name for c in selected_channels)
     if auto_translate and has_intl:
         translations = st.session_state.get("cached_translations", {})
         if not translations:
@@ -241,7 +241,7 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
     current_task = 0
 
     for ch in selected_channels:
-        is_intl = "Reddit" in ch.name or "유튜브" in ch.name
+        is_intl = "Reddit" in ch.name  # 유튜브는 한국 부모 댓글을 위해 한국어 그대로 검색
         for kw in keywords:
             current_task += 1
             search_kw = kw

@@ -4,7 +4,7 @@ import re
 import zipfile
 import pandas as pd
 from datetime import datetime
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode
 from typing import List, Dict, Any, Tuple
 from fulltext import STATUS_MEMBERS, to_json_str
 
@@ -22,12 +22,44 @@ def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
+# 주소 뒤에 붙는 추적용 값 (같은 글인데 주소만 달라지게 만드는 것들)
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "gclid", "from", "trackingcode", "referrerallarticles",
+    "fromrss", "proxyreferer", "isinf", "answerno",
+}
+
+
 def normalize_url(url):
-    if not url:
+    """
+    같은 글을 같은 주소로 맞춥니다.
+    주의: 지식iN(docId)·유튜브 댓글(v, lc)·카페(articleid)는 '?' 뒤에 글 번호가 있어서
+    '?' 뒤를 통째로 지우면 서로 다른 글이 전부 같은 글로 취급됩니다. 추적값만 지웁니다.
+    """
+    if not url or not isinstance(url, str):
         return ""
-    url = url.replace("m.blog.naver.com", "blog.naver.com")
-    parsed = urlsplit(url)
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    parts = urlsplit(url.strip())
+    host = parts.netloc.lower()
+    for mobile, pc in (("m.blog.naver.com", "blog.naver.com"),
+                       ("m.cafe.naver.com", "cafe.naver.com"),
+                       ("m.kin.naver.com", "kin.naver.com"),
+                       ("m.youtube.com", "www.youtube.com")):
+        if host == mobile:
+            host = pc
+    q = parse_qs(parts.query)
+
+    # 블로그: PostView.naver?blogId=..&logNo=.. → /아이디/글번호
+    if host == "blog.naver.com" and "blogId" in q and "logNo" in q:
+        return "https://blog.naver.com/" + q["blogId"][0] + "/" + q["logNo"][0]
+    segs = [s for s in parts.path.split("/") if s]
+    if host in ("blog.naver.com", "cafe.naver.com") and len(segs) == 2 and segs[1].isdigit():
+        return "https://" + host + "/" + segs[0] + "/" + segs[1]   # 블로그·카페 글 주소는 '?' 뒤가 필요 없음
+    # 지식iN: 질문 번호(docId)가 같으면 같은 글
+    if host == "kin.naver.com" and "docId" in q:
+        return "https://kin.naver.com/qna/detail.naver?docId=" + q["docId"][0]
+
+    keep = sorted((k, v) for k, vs in q.items() if k.lower() not in TRACKING_PARAMS for v in vs)
+    return urlunsplit(("https", host, parts.path.rstrip("/"), urlencode(keep), ""))
 
 def load_master_urls():
     ensure_data_dir()
@@ -197,6 +229,7 @@ def filter_and_process(items, filters, exclude_master_dup=True):
             existing = valid_dict[norm_url]
             if item["검색식"] not in existing["검색식"]:
                 existing["검색식"] = existing["검색식"] + " | " + item["검색식"]
+            excluded_items.append({**item, "제외사유": "이번 수집 내 중복 (같은 글: " + str(existing.get("제목", ""))[:20] + ")"})
         else:
             valid_dict[norm_url] = item
 

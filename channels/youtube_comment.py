@@ -36,7 +36,9 @@ class YouTubeCommentChannel(BaseChannel):
                 part='id,snippet',
                 maxResults=5,
                 type='video',
-                order=order_param
+                order=order_param,
+                regionCode='KR',          # 한국 영상 우선
+                relevanceLanguage='ko'    # 한국어 영상 우선
             ).execute()
 
             for video_item in search_response.get('items', []):
