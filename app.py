@@ -315,15 +315,3 @@ if not hist_df.empty:
             st.divider()
 else:
     st.info("아직 기록된 수집 이력이 없습니다. 수집을 시작하면 회차별로 다운로드 버튼이 생겨납니다.")
-
-# 8. 데이터 초기화 버튼
-with st.expander("🗑️ 전체 기록 초기화"):
-    st.warning("아래 버튼을 누르면 수집 이력, 마스터 보관함, 보관 zip 파일이 모두 삭제됩니다.")
-    if st.button("🗑️ 모든 기록 삭제하고 처음부터 다시 시작", type="secondary"):
-        import shutil
-        shutil.rmtree("data", ignore_errors=True)
-        for key in ["valid_items", "excluded_items", "last_zip_bytes", "last_zip_name"]:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.success("모든 기록이 초기화되었습니다! 새로고침하면 깨끗한 상태로 시작합니다.")
-        st.rerun()
