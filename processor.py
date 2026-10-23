@@ -48,7 +48,6 @@ def load_history() -> pd.DataFrame:
     return pd.DataFrame(columns=cols)
 
 def get_archive_file(filename: str):
-    """보관소에서 특정 회차의 zip 파일 데이터를 읽어옵니다."""
     ensure_data_dir()
     path = os.path.join(ARCHIVE_DIR, filename)
     if os.path.exists(path):
@@ -152,7 +151,6 @@ def filter_and_process(items: List[Dict[str, Any]], filters: Dict[str, Any], exc
     return valid_items, excluded_items, stats
 
 def create_zip_package(valid_items: List[Dict[str, Any]], excluded_items: List[Dict[str, Any]], time_tag: str, worker: str = "") -> Tuple[bytes, str]:
-    """결과 zip 파일을 만들고, 보관소 폴더에도 영구 저장합니다."""
     ensure_data_dir()
     zip_buffer = io.BytesIO()
 
@@ -199,7 +197,6 @@ def create_zip_package(valid_items: List[Dict[str, Any]], excluded_items: List[D
     safe_worker = re.sub(r'[\/:*?"<>|]', '', worker)[:10].strip() or "팀원"
     zip_filename = f"육아수집_{time_tag}_{safe_worker}.zip"
 
-    # 보관소 폴더에 저장
     archive_path = os.path.join(ARCHIVE_DIR, zip_filename)
     with open(archive_path, "wb") as f:
         f.write(zip_bytes)
