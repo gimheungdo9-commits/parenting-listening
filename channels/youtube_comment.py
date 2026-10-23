@@ -1,3 +1,4 @@
+import math
 import time
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
@@ -30,16 +31,23 @@ class YouTubeCommentChannel(BaseChannel):
         order_param = "relevance" if sort == "정확도순" else "date"
 
         try:
-            # 1. 관련 영상 검색 (최대 5개 영상)
+            # 1. 관련 영상 검색 (원하는 건수에 따라 5~10개 영상)
+            n_videos = min(10, max(5, math.ceil(max_count / 20)))
             search_response = youtube.search().list(
                 q=query,
                 part='id,snippet',
-                maxResults=5,
+                maxResults=n_videos,
                 type='video',
-                order=order_param
+                order=order_param,
+                regionCode='KR',          # 한국 영상 우선
+                relevanceLanguage='ko'    # 한국어 영상 우선
             ).execute()
 
-            for video_item in search_response.get('items', []):
+            videos = search_response.get('items', [])
+            # 한 영상 댓글로만 채워지지 않도록 영상마다 나눠서 가져옵니다.
+            per_video = math.ceil(max_count / max(1, len(videos)))
+
+            for video_item in videos:
                 if len(results) >= max_count:
                     break
                 video_id = video_item['id']['videoId']
@@ -50,8 +58,9 @@ class YouTubeCommentChannel(BaseChannel):
                     comments_response = youtube.commentThreads().list(
                         part='snippet',
                         videoId=video_id,
-                        maxResults=min(100, max_count - len(results)),
-                        textFormat='plainText'
+                        maxResults=max(1, min(100, per_video, max_count - len(results))),
+                        textFormat='plainText',
+                        order='relevance'          # 공감 많은 댓글 먼저
                     ).execute()
 
                     for comment_item in comments_response.get('items', []):

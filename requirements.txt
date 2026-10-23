@@ -2,3 +2,6 @@ streamlit
 pandas
 requests
 google-api-python-client
+beautifulsoup4
+gspread
+google-auth

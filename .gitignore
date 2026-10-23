@@ -1,0 +1,9 @@
+# 비밀 설정 (API 키·팀 비밀번호) — 절대 올리지 않기
+.streamlit/secrets.toml
+
+# 수집 데이터 (팀원 개인 작업 결과)
+data/
+
+# 파이썬 임시 파일
+__pycache__/
+*.pyc

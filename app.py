@@ -5,7 +5,15 @@ from datetime import datetime
 from channel_registry import get_all_channels
 from processor import (filter_and_process, create_zip_package, load_history,
                         save_to_master_and_history, load_master_urls,
-                        get_archive_file, create_cumulative_zip)
+                        get_archive_file, create_cumulative_zip, read_list_summary)
+from fulltext import enrich_full_text, mark_fetch_off, DEFAULT_BODY_AD_WORDS
+from storage import make_store, set_store, get_store, get_store_warning
+
+
+@st.cache_resource(show_spinner="📒 누적 장부에 연결하는 중...")
+def _connect_store():
+    # 서버가 켜져 있는 동안 한 번만 연결하고, 팀원 모두가 같은 연결을 씁니다.
+    return make_store(st.secrets)
 
 def translate_to_english(kw_list):
     result = {}
@@ -47,22 +55,40 @@ if not st.session_state.authenticated:
             st.error("비밀번호가 올바르지 않습니다.")
     st.stop()
 
+# 📒 누적 장부 연결 (구글 시트 또는 이 컴퓨터)
+_store, _store_warning = _connect_store()
+set_store(_store, _store_warning)
+if _store_warning:
+    _connect_store.clear()  # 연결에 실패했으면 다음에 화면을 누를 때 다시 시도
+
 # 2. 메인 헤더 & 작업자 정보
 st.title("👶 육아 소셜 리스닝 수집기")
+if _store_warning:
+    st.warning("⚠️ " + _store_warning + "  → 지금은 **이 컴퓨터(data 폴더)**에 저장합니다.")
 col_user, col_info, col_cum = st.columns([1, 2, 1])
 with col_user:
     worker_name = st.text_input("👤 작업자 이름", value="팀원1")
 with col_info:
-    master_count = len(load_master_urls())
-    st.info("📊 누적 마스터 보관함: **" + str(master_count) + "건**")
+    try:
+        master_count = len(load_master_urls())
+    except Exception as e:
+        master_count = 0
+        st.error("누적 장부를 읽지 못했어요: " + type(e).__name__)
+    st.info("📊 누적 마스터 보관함: **" + str(master_count) + "건**  ·  저장 위치: " + get_store().label)
+    sheet_url = st.secrets.get("SHEET_URL", "") if get_store().kind == "sheet" else ""
+    if sheet_url:
+        st.caption("📄 [팀 공용 구글 시트 열기](" + sheet_url + ") — '직접읽을글' 탭에서 읽음여부·메모를 바로 적을 수 있어요.")
 with col_cum:
     if master_count > 0:
-        cum_zip, cum_name = create_cumulative_zip()
-        if cum_zip:
+        # 누를 때만 만듭니다 (매번 만들면 화면이 느려져요)
+        if st.button("📦 전체 누적 파일 만들기"):
+            with st.spinner("전체 누적 파일을 만드는 중..."):
+                st.session_state.cum_zip, st.session_state.cum_name = create_cumulative_zip()
+        if st.session_state.get("cum_zip"):
             st.download_button(
-                label="📦 전체 누적 다운로드",
-                data=cum_zip,
-                file_name=cum_name,
+                label="💾 " + st.session_state.cum_name + " 받기",
+                data=st.session_state.cum_zip,
+                file_name=st.session_state.cum_name,
                 mime="application/zip"
             )
 
@@ -142,7 +168,12 @@ with col1:
     max_count = st.slider("검색식당 최대 수집 건수", 10, 1000, 100, 10)
     sort_option = st.radio("정렬 기준", ["정확도순", "최신순"], horizontal=True)
     exclude_master_dup = st.checkbox("👥 이전 팀원 수집 중복 제외", value=True)
-    auto_translate = st.checkbox("🌐 한글→영어 자동 번역 (해외 채널 동시 검색)", value=True)
+    auto_translate = st.checkbox("🌐 한글→영어 자동 번역 (Reddit 검색용)", value=True)
+    fetch_full = st.checkbox("📄 본문 전체 가져오기 (블로그·지식iN·공개 카페글)", value=True,
+                             help="필터를 통과한 글만 본문을 가져옵니다. 글마다 1~2초씩 쉬어서 시간이 걸려요. "
+                                  "회원전용 카페 글은 가져오지 않고 '직접 읽을 글' 목록으로 보냅니다.")
+    if fetch_full:
+        st.caption("⏱️ 예상: 글 100건이면 본문 가져오기에 약 2~3분 추가")
 
 with col2:
     st.subheader("3. 수집 채널 선택")
@@ -160,7 +191,7 @@ with col2:
 
 # 🌐 번역 미리보기 & 캐시
 if auto_translate and keywords:
-    has_intl = any("Reddit" in c.name or "유튜브" in c.name for c in selected_channels)
+    has_intl = any("Reddit" in c.name for c in selected_channels)
     if has_intl:
         kw_key = "|".join(sorted(keywords))
         if st.session_state.get("cached_kw_key") != kw_key:
@@ -189,10 +220,15 @@ with st.expander("⚙️ 필터 세부 설정"):
         info_words_text = st.text_area("📑 정보글 제외어 (제목)",
             value="총정리, 완벽 가이드, 완벽정리, 가이드, 정리해 드립니다, 알아보기, 알아봅시다, 시기별, 단계별, 방법 총, 꿀팁 모음, 나무위키, 위키", height=90)
         pet_words_text = st.text_area("🐱 반려동물 제외어 (제목+요약+작성자)",
-            value="고양이, 강아지, 앵무, 코뉴어, 새끼고양이, 집사, 펠렛, 사료, 이유조, 반려, 펫, 냥, 댕댕", height=90)
+            value="고양이, 강아지, 앵무, 코뉴어, 새끼고양이, 집사, 펠렛, 사료, 이유조, 반려, 펫, 냥이, 댕댕", height=90)
+        st.caption("⚠️ '냥' 한 글자는 '그냥'까지 걸러서 '냥이'로 바꿔 두었어요.")
     with f2:
         req_words_text = st.text_area("🍼 육아 필수어",
-            value="아기, 아이, 애기, 육아, 엄마, 아빠, 신생아, 개월, 돌, 이유식, 수유, 분유, 모유, 어린이집, 유치원, 통잠, 기저귀, 남편, 와이프", height=90)
+            value="아기, 아이, 애기, 육아, 엄마, 아빠, 신생아, 개월, 돌, 이유식, 수유, 분유, 모유, 어린이집, 유치원, 통잠, 기저귀, 남편, 와이프, 접종, 소아과, 어린이, 영유아, 자녀, 첫째, 둘째, 딸, 아들, 애들, 우리애", height=90)
+        body_ad_words_text = st.text_area("📄 본문 광고 표시어 (본문 전체에서 검사)",
+            value=", ".join(DEFAULT_BODY_AD_WORDS), height=90,
+            help="본문 맨 아래 '제품을 제공받아…' 같은 협찬 표시를 잡습니다. "
+                 "'광고', '쿠폰'처럼 짧은 단어는 진짜 부모 글까지 걸러서 일부러 뺐어요.")
         min_length = st.number_input("📏 최소 글자 수", 10, 200, 30)
         st.caption("🏢 작성자에 '공식'이 포함된 기업 블로그는 자동 제외됩니다.")
         st.caption("📢 '이너프렌즈3기' 같은 체험단 N기 패턴도 자동 감지됩니다.")
@@ -217,7 +253,7 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
 
     # 번역 준비
     translations = {}
-    has_intl = any("Reddit" in c.name or "유튜브" in c.name for c in selected_channels)
+    has_intl = any("Reddit" in c.name for c in selected_channels)
     if auto_translate and has_intl:
         translations = st.session_state.get("cached_translations", {})
         if not translations:
@@ -230,7 +266,7 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
     current_task = 0
 
     for ch in selected_channels:
-        is_intl = "Reddit" in ch.name or "유튜브" in ch.name
+        is_intl = "Reddit" in ch.name  # 유튜브는 한국 부모 댓글을 위해 한국어 그대로 검색
         for kw in keywords:
             current_task += 1
             search_kw = kw
@@ -256,6 +292,26 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
     status_text.write("🧹 글 정제 및 중복 검사 중...")
     valid_items, excluded_items, stats = filter_and_process(all_raw_items, filter_config, exclude_master_dup)
 
+    # 📄 파트 B: 본문 전체 가져오기 (필터 통과한 글만)
+    stats["body_ad"] = 0
+    ft_stats = None
+    if fetch_full and valid_items:
+        progress_bar.progress(0.0)
+
+        def _ft_progress(done, total, label):
+            progress_bar.progress(done / total if total else 1.0)
+            status_text.write("📄 본문 가져오는 중 **" + str(done) + " / " + str(total) + "** · " + label)
+
+        body_ad_words = [w.strip() for w in body_ad_words_text.split(",")]
+        valid_items, body_excluded, ft_stats = enrich_full_text(valid_items, body_ad_words, _ft_progress)
+        excluded_items.extend(body_excluded)
+        stats["body_ad"] = ft_stats["body_ad"]
+        stats["saved"] = len(valid_items)
+    else:
+        mark_fetch_off(valid_items)
+
+    read_count, read_cafes = read_list_summary(valid_items)
+
     time_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_bytes, zip_filename = create_zip_package(valid_items, excluded_items, time_tag, worker=worker_name)
 
@@ -273,10 +329,18 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
         "기업블로그제외": stats["corporate"],
         "무관제외": stats["irrelevant"],
         "중복제외": dup_total,
+        "본문광고제외": stats["body_ad"],
         "최종저장": stats["saved"],
+        "직접읽을글": read_count,
         "파일명": zip_filename
     }
-    save_to_master_and_history(valid_items, history_record)
+    status_text.write("📒 누적 장부에 저장하는 중...")
+    try:
+        save_to_master_and_history(valid_items, history_record, excluded_items, run_id=zip_filename)
+    except Exception as e:
+        st.error("⚠️ 누적 장부 저장에 실패했어요 (" + type(e).__name__ + "). "
+                 "결과 파일은 아래에서 받을 수 있으니 꼭 내려받아 두세요.")
+    st.session_state.pop("cum_zip", None)  # 전체 누적 파일은 새로 만들어야 함
     progress_bar.progress(1.0)
 
     # 제외 사유별 상세 요약
@@ -290,8 +354,15 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
     if stats["corporate"]: summary_parts.append("기업블로그 " + str(stats["corporate"]))
     if stats["irrelevant"]: summary_parts.append("무관 " + str(stats["irrelevant"]))
     if stats["short"]: summary_parts.append("글자수미달 " + str(stats["short"]))
+    if stats["body_ad"]: summary_parts.append("본문 광고표시 " + str(stats["body_ad"]))
     if summary_parts:
         st.info("📊 제외 상세: " + " / ".join(summary_parts) + "  (총 수집 " + str(stats["total"]) + "건)")
+    if ft_stats:
+        st.info("📄 본문: 전체 " + str(ft_stats["full"]) + "건 / 회원전용(요약만) " + str(ft_stats["members"])
+                + "건 / 가져오기 실패 " + str(ft_stats["failed"]) + "건")
+    if read_count:
+        st.warning("📌 직접 읽을 글 **" + str(read_count) + "건** (카페 " + str(read_cafes) + "곳) — "
+                   "다운로드 파일 안 `직접읽을글.csv`에 있어요. 카페에 정식 가입한 뒤 읽고 메모해 주세요.")
 
     st.session_state.valid_items = valid_items
     st.session_state.excluded_items = excluded_items
@@ -301,7 +372,7 @@ if st.button("🚀 수집 시작", type="primary", use_container_width=True):
 # 6. 결과 미리보기 및 다운로드
 if "valid_items" in st.session_state and st.session_state.valid_items:
     st.subheader("📋 수집 결과 미리보기 (" + str(len(st.session_state.valid_items)) + "건)")
-    preview_cols = ["채널", "검색식", "제목", "작성자", "작성일", "URL", "홍보의심"]
+    preview_cols = ["채널", "검색식", "제목", "본문상태", "작성자", "작성일", "URL", "홍보의심"]
     df_preview = pd.DataFrame(st.session_state.valid_items)
     for c in preview_cols:
         if c not in df_preview.columns:
@@ -319,26 +390,31 @@ if "valid_items" in st.session_state and st.session_state.valid_items:
 # 7. 회차별 이력 및 보관함
 st.divider()
 st.subheader("📦 팀 누적 수집 이력 & 회차별 다운로드")
-hist_df = load_history()
+try:
+    hist_df = load_history()
+except Exception as e:
+    hist_df = pd.DataFrame()
+    st.error("수집 이력을 읽지 못했어요: " + type(e).__name__)
+
 if not hist_df.empty:
-    for idx, row in hist_df.iterrows():
-        with st.container():
-            ct, cw, ck, cc, cb = st.columns([2, 1, 3, 1, 2])
-            ct.write("🕒 **" + str(row.get("수집일시", "")) + "**")
-            cw.write("👤 " + str(row.get("작업자", "")))
-            ck.write("🔍 " + str(row.get("검색식", "")))
-            cc.write("📊 **" + str(row.get("최종저장", 0)) + "건**")
-            fname = row.get("파일명", "")
-            file_data = get_archive_file(fname) if fname else None
-            if file_data:
-                cb.download_button(
-                    label="💾 " + str(row.get("최종저장", 0)) + "건 받기",
-                    data=file_data, file_name=fname,
-                    mime="application/zip",
-                    key="archive_" + str(idx) + "_" + str(fname)
-                )
+    show_cols = [c for c in ["수집일시", "작업자", "검색식", "채널", "최종저장", "직접읽을글", "파일명"] if c in hist_df.columns]
+    st.dataframe(hist_df[show_cols], use_container_width=True, hide_index=True)
+
+    run_names = [f for f in hist_df.get("파일명", pd.Series(dtype=str)).astype(str).tolist() if f]
+    if run_names:
+        rc1, rc2 = st.columns([3, 1])
+        with rc1:
+            picked = st.selectbox("📥 받고 싶은 회차 고르기", run_names, label_visibility="collapsed")
+        with rc2:
+            if st.button("📦 이 회차 파일 만들기"):
+                with st.spinner("회차 파일을 만드는 중..."):
+                    st.session_state.run_zip = get_archive_file(picked)
+                    st.session_state.run_zip_name = picked
+        if st.session_state.get("run_zip_name") == picked:
+            if st.session_state.get("run_zip"):
+                st.download_button("💾 " + picked + " 받기", data=st.session_state.run_zip,
+                                   file_name=picked, mime="application/zip")
             else:
-                cb.caption("파일 없음")
-            st.divider()
+                st.caption("이 회차는 장부에 남은 글이 없어요 (전부 중복이었거나, 예전 방식으로 저장된 회차예요).")
 else:
     st.info("아직 수집 이력이 없습니다. 수집을 시작하면 회차별로 기록됩니다.")
